@@ -1,0 +1,4 @@
+libreoffice
+fonts-noto-cjk
+fontconfig
+poppler-utils
