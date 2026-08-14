@@ -7,6 +7,7 @@ import tempfile
 import zipfile
 import subprocess
 from xml.sax.saxutils import escape as xml_escape
+from lxml import etree
 
 import pandas as pd
 import streamlit as st
@@ -74,6 +75,23 @@ def normalize_spaces(text):
 
 def is_yes(val):
     return safe_str(val).upper() in {"Y", "YES", "是", "1", "TRUE", "T", "✓", "√", "要", "需要"}
+
+
+def is_neg(val):
+    return safe_str(val).upper() in {"N", "NO", "否", "0", "FALSE", "F", "×", "X", "不"}
+
+
+def wants(row, col, default):
+    """每行开关：显式 Y→做、显式 N→不做、留空→按 default（自然规则）。
+    这样粘贴原始数据不填开关也能按规则自动生成。"""
+    v = safe_str(row.get(col))
+    if not v:
+        return default
+    if is_yes(v):
+        return True
+    if is_neg(v):
+        return False
+    return default
 
 
 def qty_equal(row):
@@ -273,6 +291,211 @@ def derive_outer_size(row):
     return f"{l}*{w}*{h}cm" if (l and w and h) else ""
 
 
+def int_str(val):
+    """整数字段（总外箱数/外箱装量/内盒装量）：去掉小数点，只显示整数。"""
+    s = safe_str(val)
+    if not s:
+        return ""
+    try:
+        return str(int(round(float(s))))
+    except ValueError:
+        return s
+
+
+_W = "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}"
+
+
+def _cell_avail_mm(root, p_el, fallback_mm):
+    """按品名段落实际所在表格单元格的真实宽度，算出可用宽度（mm）：
+    单元格宽 - 单元格左右边距(tcMar，缺省取表格 tblCellMar，再缺省 108twips*2) - 首行缩进(w:ind firstLine)。
+    取不到几何信息时退回 fallback_mm，保证兼容旧模板。"""
+    W = _W
+    try:
+        # 找最近的 w:tc 祖先
+        tc = p_el.getparent()
+        while tc is not None and tc.tag != f"{W}tc":
+            tc = tc.getparent()
+        if tc is None:
+            return fallback_mm
+        tcPr = tc.find(f"{W}tcPr")
+        tcW_el = tcPr.find(f"{W}tcW") if tcPr is not None else None
+        if tcW_el is None or tcW_el.get(f"{W}w") is None:
+            return fallback_mm
+        cell_dxa = float(tcW_el.get(f"{W}w"))
+
+        # 单元格左右边距：优先 tcMar，否则表格级 tblCellMar，否则默认 108+108
+        mar_l = mar_r = 108.0
+        tcMar = tcPr.find(f"{W}tcMar") if tcPr is not None else None
+        if tcMar is not None:
+            le = tcMar.find(f"{W}left"); re_ = tcMar.find(f"{W}right")
+            if le is not None and le.get(f"{W}w") is not None:
+                mar_l = float(le.get(f"{W}w"))
+            if re_ is not None and re_.get(f"{W}w") is not None:
+                mar_r = float(re_.get(f"{W}w"))
+        else:
+            tbl = tc.getparent()
+            while tbl is not None and tbl.tag != f"{W}tbl":
+                tbl = tbl.getparent()
+            if tbl is not None:
+                tblPr = tbl.find(f"{W}tblPr")
+                cm = tblPr.find(f"{W}tblCellMar") if tblPr is not None else None
+                if cm is not None:
+                    le = cm.find(f"{W}left"); re_ = cm.find(f"{W}right")
+                    if le is not None and le.get(f"{W}w") is not None:
+                        mar_l = float(le.get(f"{W}w"))
+                    if re_ is not None and re_.get(f"{W}w") is not None:
+                        mar_r = float(re_.get(f"{W}w"))
+
+        # 首行缩进
+        indent_dxa = 0.0
+        pPr = p_el.find(f"{W}pPr")
+        ind = pPr.find(f"{W}ind") if pPr is not None else None
+        if ind is not None and ind.get(f"{W}firstLine") is not None:
+            indent_dxa = float(ind.get(f"{W}firstLine"))
+
+        avail_dxa = cell_dxa - mar_l - mar_r - indent_dxa
+        if avail_dxa <= 0:
+            return fallback_mm
+        return avail_dxa / 1440.0 * 25.4
+    except Exception:
+        return fallback_mm
+
+
+def _set_paragraph_font_pt(p_el, pt):
+    """把某个 w:p 内所有含文字的 run 字号设为 pt（保留其余格式）。返回是否改动。"""
+    W = _W
+    half = str(int(round(pt * 2)))
+    changed = False
+    for r in p_el.iter(f"{W}r"):
+        if not r.findall(f"{W}t"):
+            continue
+        rPr = r.find(f"{W}rPr")
+        if rPr is None:
+            rPr = etree.SubElement(r, f"{W}rPr"); r.insert(0, rPr)
+        for tag in ("sz", "szCs"):
+            e = rPr.find(f"{W}{tag}")
+            if e is None:
+                e = etree.SubElement(rPr, f"{W}{tag}")
+            e.set(f"{W}val", half)
+        changed = True
+    return changed
+
+
+def shrink_name_in_docx(docx_path, name_text, max_mm, max_pt=4.0, min_pt=2.0, forced_pt=None):
+    """外箱/内盒品名在文本框/单元格里、docxtpl RichText 不生效，改为渲染后处理：
+    按品名所在单元格的真实可用宽度自适应缩小字号，保证单行不换行（保留原有白色/字体/加粗）。
+    max_mm 仅作为取不到真实几何信息时的兜底宽度；多处出现时取其中最窄单元格为准，保证各份一致不换行。
+    forced_pt：跳过自动测算，直接强制使用该字号（配合 ensure_name_no_wrap 的换行校验回退使用）。
+    返回实际使用的字号（pt）。"""
+    W = _W
+    target = normalize_spaces(name_text)
+    if not target:
+        return None
+    zin = zipfile.ZipFile(docx_path)
+    parts = {it.filename: zin.read(it.filename) for it in zin.infolist()}
+    infos = zin.infolist(); zin.close()
+    root = etree.fromstring(parts["word/document.xml"])
+
+    matched_paras = [p for p in root.iter(f"{W}p")
+                      if normalize_spaces("".join(t.text or "" for t in p.iter(f"{W}t"))) == target]
+    if not matched_paras:
+        return None
+
+    if forced_pt is not None:
+        fit = forced_pt
+    else:
+        avail_list = [_cell_avail_mm(root, p, max_mm) for p in matched_paras]
+        real_max_mm = min(avail_list) if avail_list else max_mm
+        real_max_mm = min(real_max_mm, max_mm) if max_mm else real_max_mm
+        fit = calc_fit_font_pt(target, real_max_mm, get_resource_path("fonts/微软雅黑.ttf"),
+                                max_pt=max_pt, min_pt=min_pt)
+
+    changed = 0
+    for p in matched_paras:
+        if _set_paragraph_font_pt(p, fit):
+            changed += 1
+    if changed:
+        parts["word/document.xml"] = etree.tostring(root, xml_declaration=True, encoding="UTF-8", standalone=True)
+        tmp = docx_path + ".t"
+        with zipfile.ZipFile(tmp, "w", zipfile.ZIP_DEFLATED) as zo:
+            for it in infos:
+                zo.writestr(it, parts[it.filename])
+        os.replace(tmp, docx_path)
+    return fit
+
+
+def _pdf_word_boxes(pdf_path):
+    """用 pdftotext -bbox 拿每个词的坐标，用于校验品名是否被换行拆开。"""
+    out = subprocess.run(["pdftotext", "-bbox", pdf_path, "-"], capture_output=True, text=True, timeout=60)
+    if out.returncode != 0 or not out.stdout:
+        return []
+    root = etree.fromstring(out.stdout.encode("utf-8"))
+    ns = {"h": "http://www.w3.org/1999/xhtml"}
+    words = []
+    for page_i, page in enumerate(root.findall(".//h:page", ns)):
+        for w in page.findall(".//h:word", ns):
+            try:
+                words.append({
+                    "page": page_i, "text": w.text or "",
+                    "xMin": float(w.get("xMin")), "yMin": float(w.get("yMin")),
+                })
+            except (TypeError, ValueError):
+                continue
+    return words
+
+
+def name_wrapped_in_pdf(pdf_path, name_text, y_tol=1.0):
+    """校验品名在生成的 PDF 里是否被换行拆成了两行。
+    做法：按 y 坐标把词聚成"行"，若某一行的文本恰好是品名的真前缀/后缀（而非完整品名），
+    说明品名被拆到了相邻行 —— 判定为换行。"""
+    target = normalize_spaces(name_text)
+    if not target:
+        return False
+    try:
+        words = _pdf_word_boxes(pdf_path)
+    except Exception:
+        return False
+    if not words:
+        return False
+    lines = []  # list of (page, y_key, [words])
+    for w in words:
+        found = None
+        for entry in lines:
+            if entry[0] == w["page"] and abs(entry[1] - w["yMin"]) <= y_tol:
+                found = entry
+                break
+        if found is None:
+            found = (w["page"], w["yMin"], [])
+            lines.append(found)
+        found[2].append(w)
+    for _page, _y, ws in lines:
+        line_text = normalize_spaces(" ".join(x["text"] for x in sorted(ws, key=lambda x: x["xMin"])))
+        if line_text and line_text != target and (target.startswith(line_text) or target.endswith(line_text)):
+            return True
+    return False
+
+
+def ensure_name_no_wrap(docx_path, name_text, out_dir, profile, max_mm=34.0, max_pt=6.0, min_pt=2.0, step=0.5):
+    """渲染并转 PDF 后用真实版面校验品名有没有被换行；如果换行了就调小字号重转，
+    直到不换行或到达最小字号为止（保证"绝不允许换行"这条硬性要求，不完全依赖字体宽度估算）。"""
+    target = normalize_spaces(name_text)
+    if not target:
+        convert_docx_to_pdf(docx_path, out_dir, profile)
+        return
+    fit = shrink_name_in_docx(docx_path, name_text, max_mm, max_pt=max_pt, min_pt=min_pt)
+    convert_docx_to_pdf(docx_path, out_dir, profile)
+    if fit is None:
+        return
+    base = os.path.splitext(os.path.basename(docx_path))[0]
+    pdf_path = os.path.join(out_dir, f"{base}.pdf")
+    tries = 0
+    while os.path.exists(pdf_path) and name_wrapped_in_pdf(pdf_path, name_text) and fit > min_pt and tries < 8:
+        fit = max(min_pt, fit - step)
+        shrink_name_in_docx(docx_path, name_text, max_mm, forced_pt=fit)
+        convert_docx_to_pdf(docx_path, out_dir, profile)
+        tries += 1
+
+
 def resolve_bl(row):
     """品牌 Logo 判定：优先读 BL 列（Excel 公式值）；为空则按归一化英文名判断，
     兼容数据里的不间断空格（原公式用普通空格 SEARCH 会漏判，导致 Logo 缺失）。"""
@@ -287,7 +510,7 @@ def resolve_bl(row):
     return ""
 
 
-TYPE_LABELS = {"外箱": "外箱标 (Outer)", "内盒": "内盒标 (Inner)", "ITF": "ITF 标", "BD": "BD 标"}
+TYPE_LABELS = {"外箱": "外箱", "内盒": "内盒", "ITF": "ITF 标", "BD": "BD 标"}
 ALL_TYPES = ["外箱", "内盒", "ITF", "BD"]
 
 # 命名列 <-> 生成类型
@@ -309,14 +532,14 @@ MERGED_SCHEMA = [
     {"n": "产品品名", "kind": "data", "text": True},
     {"n": "产品英文名", "kind": "data", "text": True},
     {"n": "PO号", "kind": "data", "text": True},
-    {"n": "总外箱数", "kind": "data"},
+    {"n": "总外箱数", "kind": "data", "intfmt": True},
     {"n": "TPNB", "kind": "data", "text": True},
     {"n": "TPND", "kind": "data", "text": True},
     {"n": "ITF", "kind": "data", "text": True},
     {"n": "category", "kind": "data", "text": True},
     {"n": "EAN", "kind": "data", "text": True},
-    {"n": "外箱装量", "kind": "data"},
-    {"n": "内盒装量", "kind": "data"},
+    {"n": "外箱装量", "kind": "data", "intfmt": True},
+    {"n": "内盒装量", "kind": "data", "intfmt": True},
     {"n": "CEORMSNO", "kind": "data", "text": True},
     {"n": "SKU", "kind": "data", "text": True},
     {"n": "VSN", "kind": "data", "text": True},
@@ -406,7 +629,9 @@ def build_blank_template():
             else:
                 cell.value = ex.get(spec["n"], "")
                 if spec.get("text"):
-                    cell.number_format = "@"   # 仅对手填代码列设文本，保护前导0（不影响公式引用的数值列）
+                    cell.number_format = "@"   # 代码列设文本，保护前导0
+                elif spec.get("intfmt"):
+                    cell.number_format = "0"   # 总外箱数/装量：整数显示，无小数点
 
     # 数据验证（黄色列下拉）
     for c, spec in enumerate(MERGED_SCHEMA, start=1):
@@ -447,6 +672,147 @@ def build_blank_template():
     buf = io.BytesIO()
     wb.save(buf)
     return buf.getvalue()
+
+
+# ==========================================
+# 后台公式引擎（C）：从原始数据算出所有派生列，不再依赖 Excel 公式
+# ==========================================
+def derive_country(po):
+    return {"380": "UK", "999": "CE", "520": "Ireland"}.get(safe_str(po)[:3], "")
+
+
+def derive_heavy(po, gross_weight):
+    p = safe_str(po)[:3]
+    try:
+        gw = float(safe_str(gross_weight))
+    except ValueError:
+        return ""
+    if (p == "380" and gw > 23) or (p == "999" and gw > 14):
+        return "双人抬"
+    return ""
+
+
+def space_itf(itf):
+    v = _strip_spaces(safe_str(itf))
+    return f"{v[:3]} {v[3:8]} {v[8:]}" if len(v) >= 9 else v
+
+
+def _ratio(outer_qty, inner_qty):
+    try:
+        oq, iq = float(safe_str(outer_qty)), float(safe_str(inner_qty))
+    except ValueError:
+        return None
+    if iq == 0:
+        return None
+    return oq / iq
+
+
+def derive_bd_num(outer_qty, inner_qty):
+    r = _ratio(outer_qty, inner_qty)
+    if r is None or r == 1:
+        return " "
+    return f"B/D {int(r) if r == int(r) else r}"
+
+
+def derive_bd_barcode(itf, outer_qty, inner_qty):
+    v = _strip_spaces(safe_str(itf))
+    r = _ratio(outer_qty, inner_qty)
+    if not v or r is None or r == 1:
+        return ""
+    return f"02{v}37{int(round(r)):02d}"
+
+
+def space_bd(bd):
+    v = _strip_spaces(safe_str(bd))
+    return f"{v[:2]} {v[2:16]} {v[16:18]} {v[18:]}" if len(v) >= 20 else v
+
+
+def derive_tape(festival):
+    f = safe_str(festival)
+    if not f:
+        return " "
+    for a, b in TAPE_LOOKUP:
+        if a == f:
+            return f"{b}胶带用于上口封箱"
+    return " "
+
+
+def enrich_row(raw, cdu_map=None):
+    """把一行原始数据补全为含所有派生列的完整行（仅填空缺项，已有值不覆盖）。
+    这样'网页粘贴原始数据'与'上传带公式的Excel'两条路都能生成。"""
+    row = dict(raw)
+
+    def cur(k):
+        return safe_str(row.get(k))
+
+    itf = cur("ITF")
+    po = cur("PO号")
+    if not cur("订单国家"):
+        row["订单国家"] = derive_country(po)
+    if not cur("CON不加粗") and not cur("CON加粗"):
+        row["CON不加粗"], row["CON加粗"] = split_orms_bold(get_orms(row))
+    if not cur("外箱尺寸"):
+        row["外箱尺寸"] = derive_outer_size(row)
+    if not cur("双人抬标识"):
+        row["双人抬标识"] = derive_heavy(po, cur("毛重"))
+    if not cur("BL"):
+        row["BL"] = resolve_bl(row)
+    if not cur("ITF加空格"):
+        row["ITF加空格"] = space_itf(itf)
+    if not cur("外箱BD号"):
+        row["外箱BD号"] = derive_bd_num(cur("外箱装量"), cur("内盒装量"))
+    if not cur("BD条码号"):
+        row["BD条码号"] = derive_bd_barcode(itf, cur("外箱装量"), cur("内盒装量"))
+    if not cur("BD条码号加空格"):
+        row["BD条码号加空格"] = space_bd(cur("BD条码号"))
+    if not cur("胶带颜色"):
+        row["胶带颜色"] = derive_tape(cur("节日logo"))
+    # CDU（D）：按 ITF 从清单自动匹配外箱/内盒是否接触 CDU
+    if cdu_map:
+        key = _strip_spaces(itf)
+        if key in cdu_map:
+            oflag, iflag = cdu_map[key]
+            if not cur("是否有CDU") and oflag:
+                row["是否有CDU"] = oflag
+            if not cur("内盒是否直接接触CDU") and iflag:
+                row["内盒是否直接接触CDU"] = iflag
+    if not cur("有CDU加印文字") and is_yes(row.get("是否有CDU")):
+        row["有CDU加印文字"] = _CDU
+    if not cur("有CDU加印文字内盒版") and is_yes(row.get("内盒是否直接接触CDU")):
+        row["有CDU加印文字内盒版"] = _CDU
+    return row
+
+
+# ==========================================
+# CDU 清单（D）：仓库内置 CSV，可在前端查看/编辑/导入/导出，按 ITF 匹配
+# ==========================================
+CDU_CSV = get_resource_path("cdu_list.csv")
+CDU_COLS = ["ITF", "外箱接触CDU", "内盒接触CDU"]
+
+
+@st.cache_data
+def load_cdu_df_bundled():
+    if os.path.exists(CDU_CSV):
+        try:
+            df = pd.read_csv(CDU_CSV, dtype=str).fillna("")
+            for c in CDU_COLS:
+                if c not in df.columns:
+                    df[c] = ""
+            return df[CDU_COLS]
+        except Exception:
+            pass
+    return pd.DataFrame(columns=CDU_COLS)
+
+
+def cdu_df_to_map(df):
+    m = {}
+    if df is None or len(df) == 0:
+        return m
+    for _, r in df.iterrows():
+        key = _strip_spaces(safe_str(r.get("ITF")))
+        if key:
+            m[key] = (safe_str(r.get("外箱接触CDU")), safe_str(r.get("内盒接触CDU")))
+    return m
 
 
 # ==========================================
@@ -500,7 +866,7 @@ def gen_outer(row, work_dir, out_dir, used, profile):
         "EAN": safe_str(row.get("EAN")), "毛重": safe_str(row.get("毛重")),
         "净重": safe_str(row.get("净重")), "外箱尺寸": derive_outer_size(row),
         "其他备注": safe_str(row.get("其他备注")), "订单国家": safe_str(row.get("订单国家")),
-        "总外箱数": safe_str(row.get("总外箱数")),
+        "总外箱数": int_str(row.get("总外箱数")),
     })
     bl = resolve_bl(row)
     bl_path = get_resource_path(f"2. Brand Logo/{bl}.png")
@@ -517,7 +883,7 @@ def gen_outer(row, work_dir, out_dir, used, profile):
     docx = os.path.join(work_dir, f"{name}.docx")
     tpl.render(ctx)
     tpl.save(docx)
-    convert_docx_to_pdf(docx, out_dir, profile)
+    ensure_name_no_wrap(docx, safe_str(row.get("产品英文名")), out_dir, profile, max_mm=34.0, max_pt=6.5, min_pt=2.0)
     _confirm_pdf(out_dir, work_dir, name)
     return [{"命名": name, "状态": "成功", "说明": "UK" if is_uk else "CE"}]
 
@@ -542,7 +908,7 @@ def gen_inner(row, work_dir, out_dir, used, profile):
     docx = os.path.join(work_dir, f"{name}.docx")
     tpl.render(ctx)
     tpl.save(docx)
-    convert_docx_to_pdf(docx, out_dir, profile)
+    ensure_name_no_wrap(docx, safe_str(row.get("产品英文名")), out_dir, profile, max_mm=34.0, max_pt=6.0, min_pt=2.0)
     _confirm_pdf(out_dir, work_dir, name)
     return [{"命名": name, "状态": "成功", "说明": ""}]
 
@@ -555,7 +921,7 @@ def gen_itf(row, work_dir, out_dir, used, profile, want_uk, want_ce):
     validate_itf(itf_val, itf_spaced)
 
     eng_raw = safe_str(row.get("产品英文名"))
-    inner_qty = safe_str(row.get("内盒装量"))
+    inner_qty = int_str(row.get("内盒装量"))
     # 品名自适应字号：用与渲染相同的字体(微软雅黑)测量，保证宽度一致、长名绝不换行
     font_path = get_resource_path("fonts/微软雅黑.ttf")
     fit_pt = calc_fit_font_pt(normalize_spaces(eng_raw), 64.0, font_path, max_pt=7.5, min_pt=3.0)
@@ -628,47 +994,85 @@ def gen_bd(row, work_dir, out_dir, used, profile):
 # ==========================================
 # 生成前“体检”：不出 PDF，只做校验
 # ==========================================
-def preflight(df, selected):
+# 完整性必填规则（按订单前缀）：
+_DATA_FIELDS = ["产品品名", "产品英文名", "PO号", "总外箱数", "TPNB", "TPND", "ITF",
+                "category", "EAN", "外箱装量", "内盒装量", "CEORMSNO", "SKU", "VSN",
+                "毛重", "净重", "外箱长", "外箱宽", "外箱高"]
+_REQ_UK = [c for c in _DATA_FIELDS if c not in ("CEORMSNO", "SKU")]   # 380/520：除 CEORMSNO/SKU 外都必填
+_REQ_CE = [c for c in _DATA_FIELDS if c not in ("TPNB", "TPND")]      # 999：除 TPNB/TPND 外都必填
+
+
+def _missing_or_zero(v):
+    s = safe_str(v)
+    if not s:
+        return True
+    try:
+        return float(s) == 0
+    except ValueError:
+        return False
+
+
+# 固定位数校验（数字位数）：TPNB/TPND 9、ITF 14、EAN 13、CEORMSNO 13、SKU 9
+_DIGIT_LEN = {"TPNB": 9, "TPND": 9, "ITF": 14, "EAN": 13, "CEORMSNO": 13, "SKU": 9}
+
+
+def _iss(idx, po, col, msg):
+    return {"idx": idx, "行": idx + 2, "PO号": po or "（PO号为空）", "列": col, "问题": msg}
+
+
+def preflight(df, selected, cdu_map=None):
+    """返回结构化问题列表：[{idx, 行, PO号, 列, 问题}]。"""
     issues = []
-    if "PO号" not in df.columns and "外箱" in selected:
-        issues.append("缺少列：PO号（外箱标必需）")
-    if "ITF" not in df.columns and "ITF" in selected:
-        issues.append("缺少列：ITF（ITF 标必需）")
-    if "BD条码号" not in df.columns and "BD" in selected:
-        issues.append("缺少列：BD条码号（BD 标必需）")
+    for idx, raw in df.iterrows():
+        row = enrich_row(raw, cdu_map)
+        country = safe_str(row.get("订单国家"))
+        has_inner = not qty_equal(row)
+        po = safe_str(row.get("PO号"))
+        prefix = po[:3]
 
-    # 公式列整片为空 → 多半是没在 Excel 打开保存、公式未计算
-    check_cols = [c for c in ["外箱文件命名列", "BD条码号", "双人抬标识", "ITF加空格", "CON加粗"] if c in df.columns]
-    if check_cols and all(df[c].astype(str).str.strip().replace("nan", "").eq("").all() for c in check_cols):
-        issues.append("⚠️ 公式列全为空：数据源似乎未在 Excel 中打开并保存，公式尚未计算。"
-                      "请先用 Excel 打开、保存一次再上传，否则命名/条码等会缺失。")
+        # ① 完整性 + TPNB/TPND 的 "/" 规则（与所选类型无关，始终校验）
+        if not po:
+            issues.append(_iss(idx, "", "PO号", "PO号为空"))
+        elif prefix in ("380", "520"):
+            for c in _REQ_UK:
+                if _missing_or_zero(row.get(c)):
+                    issues.append(_iss(idx, po, c, "不能为空或0（380/520 必填）"))
+            for c in ("TPNB", "TPND"):
+                if "/" in safe_str(row.get(c)):
+                    issues.append(_iss(idx, po, c, "含 '/'（380/520 不允许）"))
+        elif prefix == "999":
+            for c in _REQ_CE:
+                if _missing_or_zero(row.get(c)):
+                    issues.append(_iss(idx, po, c, "不能为空或0（999 必填）"))
+            # 999：TPNB/TPND 允许留空或含 '/'
+        else:
+            issues.append(_iss(idx, po, "PO号", f"前缀 '{prefix}' 非 380/520/999"))
 
-    # 只报“真正的数据错误”。同款去重、无内盒无BD 属正常，生成时自动跳过，不在此报错。
-    for idx, row in df.iterrows():
-        rn = idx + 2
-        if "外箱" in selected and is_yes(row.get("是否要做外箱")):
-            po = safe_str(row.get("PO号"))
-            if not po:
-                issues.append(f"第{rn}行 外箱：PO号为空")
-            elif not (po.startswith("380") or po.startswith("520") or po.startswith("999")):
-                issues.append(f"第{rn}行 外箱：PO号'{po}'前缀非380/520/999")
-        if "ITF" in selected and (is_yes(row.get("是否需要ITF-UK")) or is_yes(row.get("是否需要ITF-CE"))):
+        # ② 固定位数校验（有值且非 '/' 才校验；空缺由必填规则负责）
+        for c, n in _DIGIT_LEN.items():
+            v = safe_str(row.get(c))
+            if not v or (c in ("TPNB", "TPND") and "/" in v):
+                continue
+            if not (v.isdigit() and len(v) == n):
+                issues.append(_iss(idx, po, c, f"必须是 {n} 位数字（当前 {len(v)} 位）"))
+
+        # ③ 条码正确性
+        if "ITF" in selected and (wants(row, "是否需要ITF-UK", country in ("UK", "Ireland")) or wants(row, "是否需要ITF-CE", country == "CE")):
             try:
                 validate_itf(safe_str(row.get("ITF")), safe_str(row.get("ITF加空格", safe_str(row.get("ITF")))))
             except ValueError as e:
-                issues.append(f"第{rn}行 ITF：{e}")
-        # BD 仅在有内盒(装量不等)且有条码值时校验；无内盒→无BD，属正常不报
-        if "BD" in selected and is_yes(row.get("是否要做BD")) and not qty_equal(row):
+                issues.append(_iss(idx, po, "ITF", str(e)))
+        if "BD" in selected and has_inner and wants(row, "是否要做BD", True):
             bdv = safe_str(row.get("BD条码号"))
             if bdv:
                 try:
                     validate_code128(bdv, safe_str(row.get("BD条码号加空格", bdv)))
                 except ValueError as e:
-                    issues.append(f"第{rn}行 BD：{e}")
+                    issues.append(_iss(idx, po, "BD条码号", str(e)))
     return issues
 
 
-def run_all(df, selected):
+def run_all(df, selected, cdu_map=None):
     with tempfile.TemporaryDirectory() as work:
         base = os.path.join(work, "out")
         profile = os.path.join(work, "lo")
@@ -682,17 +1086,21 @@ def run_all(df, selected):
         status = st.empty()
         total = len(df)
 
-        for idx, row in df.iterrows():
+        for idx, raw in df.iterrows():
             rn = idx + 2
+            row = enrich_row(raw, cdu_map)  # 后台算全所有派生列
+            country = safe_str(row.get("订单国家"))
+            has_inner = not qty_equal(row)
+            w_uk = wants(row, "是否需要ITF-UK", country in ("UK", "Ireland"))
+            w_ce = wants(row, "是否需要ITF-CE", country == "CE")
             jobs = []
-            if "外箱" in selected and is_yes(row.get("是否要做外箱")):
+            if "外箱" in selected and wants(row, "是否要做外箱", True):
                 jobs.append(("外箱", lambda r: gen_outer(r, work, subdirs["外箱"], used["外箱"], profile)))
-            if "内盒" in selected and is_yes(row.get("是否要做内盒")) and not qty_equal(row):
+            if "内盒" in selected and has_inner and wants(row, "是否要做内盒", True):
                 jobs.append(("内盒", lambda r: gen_inner(r, work, subdirs["内盒"], used["内盒"], profile)))
-            if "ITF" in selected and (is_yes(row.get("是否需要ITF-UK")) or is_yes(row.get("是否需要ITF-CE"))):
-                jobs.append(("ITF", lambda r: gen_itf(r, work, subdirs["ITF"], used["ITF"], profile,
-                                                       is_yes(r.get("是否需要ITF-UK")), is_yes(r.get("是否需要ITF-CE")))))
-            if "BD" in selected and is_yes(row.get("是否要做BD")) and not qty_equal(row):
+            if "ITF" in selected and (w_uk or w_ce):
+                jobs.append(("ITF", lambda r, u=w_uk, c=w_ce: gen_itf(r, work, subdirs["ITF"], used["ITF"], profile, u, c)))
+            if "BD" in selected and has_inner and wants(row, "是否要做BD", True):
                 jobs.append(("BD", lambda r: gen_bd(r, work, subdirs["BD"], used["BD"], profile)))
             for tname, fn in jobs:
                 try:
@@ -727,67 +1135,120 @@ def run_all(df, selected):
 
 
 # ==========================================
-# UI
+# UI（v2：网页粘贴原始数据 + 公式后台化 + CDU 按 ITF 自动匹配）
 # ==========================================
-st.title("📦 Tesco 标贴与纸箱生成系统")
-st.caption("Made By Sherry ｜ 仅供 Suncha 内部使用 ｜ 合并数据源版")
+INPUT_DATA_COLS = ["产品品名", "产品英文名", "PO号", "总外箱数", "TPNB", "TPND", "ITF",
+                   "category", "EAN", "外箱装量", "内盒装量", "CEORMSNO", "SKU", "VSN",
+                   "毛重", "净重", "外箱长", "外箱宽", "外箱高"]
+INPUT_SELECT_COLS = ["节日logo", "是否要做外箱", "是否要做内盒", "是否需要ITF-UK", "是否需要ITF-CE", "是否要做BD"]
+INPUT_COLUMNS = INPUT_DATA_COLS + INPUT_SELECT_COLS
+FESTIVALS = [x[0] for x in TAPE_LOOKUP]
 
+
+def _empty_input_df(n=15):
+    return pd.DataFrame("", index=range(n), columns=INPUT_COLUMNS)
+
+
+def _clean_input_df(df):
+    df = df.fillna("").astype(str)
+    df.columns = [str(c).strip() for c in df.columns]
+    key = [c for c in ["产品品名", "产品英文名", "PO号", "ITF"] if c in df.columns]
+    if key:
+        mask = df[key].apply(lambda r: any(str(v).strip() for v in r), axis=1)
+        df = df[mask]
+    return df.reset_index(drop=True)
+
+
+st.title("📦 Tesco 标贴与纸箱生成系统")
+st.caption("Made By Sherry ｜ 仅供 Suncha 内部使用 ｜ v2 · 网页录入 + 后台公式")
+
+# ---- CDU 清单（D）：按 ITF 自动匹配 ----
+if "cdu_df" not in st.session_state:
+    st.session_state.cdu_df = load_cdu_df_bundled()
 with st.sidebar:
-    st.header("📄 数据源模板")
-    st.write("第一次使用？下载空白模板，**用 Excel 打开填写并保存**，让公式先算好再上传。")
-    st.download_button("⬇️ 下载空白数据源模板", data=build_blank_template(),
+    st.header("🏷️ CDU 清单")
+    st.caption("按 ITF 自动匹配：哪些产品外箱/内盒直接接触 CDU。填 Y 的会在标签上加印 CDU 文案。")
+    cdu_up = st.file_uploader("导入 CDU 清单 CSV", type=["csv"], key="cdu_up")
+    if cdu_up is not None:
+        try:
+            st.session_state.cdu_df = pd.read_csv(cdu_up, dtype=str).fillna("")
+            st.success("CDU 清单已导入。")
+        except Exception as e:
+            st.error(f"导入失败：{e}")
+    cdu_edited = st.data_editor(
+        st.session_state.cdu_df, num_rows="dynamic", use_container_width=True, key="cdu_editor",
+        column_config={
+            "ITF": st.column_config.TextColumn("ITF", help="产品 ITF 条码值"),
+            "外箱接触CDU": st.column_config.SelectboxColumn("外箱接触CDU", options=["", "Y", "N"]),
+            "内盒接触CDU": st.column_config.SelectboxColumn("内盒接触CDU", options=["", "Y", "N"]),
+        })
+    st.download_button("⬇️ 导出当前 CDU 清单", cdu_edited.to_csv(index=False).encode("utf-8-sig"),
+                       "cdu_list.csv", "text/csv", use_container_width=True)
+    st.caption("云端重启会还原为仓库内置版；新增/修改后请导出 CSV 重新提交仓库（或下次导入）。")
+    st.divider()
+    st.download_button("⬇️ 下载空白 Excel 模板（备用）", data=build_blank_template(),
                        file_name="Tesco数据源模板.xlsx",
                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                        use_container_width=True)
-    st.divider()
-    st.markdown("**表头三色**：\n\n"
-                "- 🟩 绿色：你手填的数据\n"
-                "- 🟧 橙色：公式列，Excel 自动算（勿手改）\n"
-                "- 🟨 黄色：人工选择（下拉 Y/N 或节日）\n\n"
-                "命名、CON、外箱尺寸、双人抬、BL、ITF加空格、BD条码号等均由公式自动生成。")
+cdu_map = cdu_df_to_map(cdu_edited)
 
-uploaded = st.file_uploader("📥 第一步：上传数据源 Excel", type=["xlsx", "xls"])
+# ---- 第一步：录入数据 ----
+st.markdown("**第一步：录入数据**（只填原始数据，公式/命名/条码等由系统自动算）")
+mode = st.radio("录入方式", ["① 粘贴 / 编辑数据（推荐）", "② 上传 Excel"], horizontal=True, label_visibility="collapsed")
 
-if uploaded is not None:
-    df = pd.read_excel(uploaded, dtype=str)
-    df.columns = [str(c).strip() for c in df.columns]
-    st.success(f"读取成功，共 {len(df)} 行。")
+df = None
+if mode.startswith("①"):
+    st.caption("可直接从 Excel 复制一整片数据粘贴进来，或逐格填写。右侧几列是人工选择——**留空即按规则自动**"
+               "（外箱默认做、有内盒才做内盒/BD、ITF 按订单国家）；只有明确不做才填 N。")
+    if "input_df" not in st.session_state:
+        st.session_state.input_df = _empty_input_df()
+    yn = ["", "Y", "N"]
+    colcfg = {c: st.column_config.SelectboxColumn(c, options=yn, width="small")
+              for c in ["是否要做外箱", "是否要做内盒", "是否需要ITF-UK", "是否需要ITF-CE", "是否要做BD"]}
+    colcfg["节日logo"] = st.column_config.SelectboxColumn("节日logo", options=[""] + FESTIVALS)
+    edited = st.data_editor(st.session_state.input_df, num_rows="dynamic",
+                            use_container_width=True, key="input_editor", column_config=colcfg)
+    df = _clean_input_df(edited)
+    if len(df):
+        st.success(f"当前有效数据 {len(df)} 行。")
+else:
+    uploaded = st.file_uploader("上传数据源 Excel（原始数据即可，无需公式）", type=["xlsx", "xls"])
+    if uploaded is not None:
+        df = _clean_input_df(pd.read_excel(uploaded, dtype=str))
+        st.success(f"读取成功，共 {len(df)} 行。")
 
-    with st.expander("👀 预览数据（前 20 行）", expanded=False):
-        preview = df.head(20).copy()
-        preview.insert(0, "Excel行号", range(2, 2 + len(preview)))  # 表头是第1行，数据从第2行起
-        st.caption("行号与 Excel 一致：表头为第 1 行，数据从第 2 行开始（下方报错的“第N行”即此行号）。")
-        st.dataframe(preview, use_container_width=True, hide_index=True)
+# ---- 第二步：自动体检 + 选类型 + 生成 ----
+if df is not None and len(df):
+    # 录入后自动体检（每次编辑实时刷新）；按 PO 合并显示 + 问题格标红
+    issues = preflight(df, ALL_TYPES, cdu_map)
+    if issues:
+        from collections import OrderedDict
+        grouped = OrderedDict()
+        for it in issues:
+            grouped.setdefault(it["PO号"], []).append(it)
+        st.error(f"⚠️ 数据体检发现 {len(issues)} 处问题，涉及 {len(grouped)} 个 PO（按 PO 对照上方表格修改）：")
+        gp_rows = [{"PO号": po, "问题数": len(its),
+                    "问题": "；".join((f"{i['列']}：{i['问题']}" if i["列"] else i["问题"]) for i in its)}
+                   for po, its in grouped.items()]
+        st.dataframe(pd.DataFrame(gp_rows), use_container_width=True, hide_index=True)
+    else:
+        st.success("✅ 数据体检通过，未发现问题。")
 
-    st.markdown("**第二步：勾选本次要生成的类型**（每行还会看它自己的开关列）")
+    st.markdown("**第二步：勾选本次要生成的类型**")
     cols = st.columns(4)
-    selected = []
-    for i, t in enumerate(ALL_TYPES):
-        if cols[i].checkbox(TYPE_LABELS[t], value=True, key=f"chk_{t}"):
-            selected.append(t)
+    selected = [t for i, t in enumerate(ALL_TYPES)
+                if cols[i].checkbox(TYPE_LABELS[t], value=True, key=f"chk_{t}")]
 
-    c1, c2 = st.columns([1, 1])
-    if c1.button("🩺 生成前体检", use_container_width=True):
-        if not selected:
-            st.warning("请至少勾选一种类型。")
-        else:
-            issues = preflight(df, selected)
-            if issues:
-                st.error(f"发现 {len(issues)} 处隐患，建议修好再生成：")
-                st.dataframe(pd.DataFrame({"问题": issues}), use_container_width=True, hide_index=True)
-            else:
-                st.success("体检通过，未发现明显问题 ✅")
-
-    if c2.button("🚀 开始生成", type="primary", use_container_width=True):
+    if st.button("🚀 开始生成", type="primary", use_container_width=True):
         st.session_state.download_data = None
         if not selected:
             st.warning("请至少勾选一种类型。")
         else:
-            results, actual, preview_png = run_all(df, selected)
+            results, actual, preview_png = run_all(df, selected, cdu_map)
             if actual > 0:
                 st.success(f"🎉 完成！实际生成 {actual} 个 PDF（按类型分文件夹打包）。")
             else:
-                st.warning("没有生成任何文件，请检查开关列与数据。")
+                st.warning("没有生成任何文件，请检查数据与开关列。")
             if results:
                 rdf = pd.DataFrame(results)[["行", "类型", "命名", "状态", "说明"]]
                 fails = rdf[rdf["状态"] == "失败"]
