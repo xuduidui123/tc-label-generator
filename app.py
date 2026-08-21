@@ -1050,6 +1050,9 @@ def preflight(df, selected, cdu_map=None):
 
         # ② 固定位数校验（有值且非 '/' 才校验；空缺由必填规则负责）
         for c, n in _DIGIT_LEN.items():
+            # 380/520（UK）订单不使用 CEORMSNO/SKU，跳过其位数校验
+            if prefix in ("380", "520") and c in ("CEORMSNO", "SKU"):
+                continue
             v = safe_str(row.get(c))
             if not v or (c in ("TPNB", "TPND") and "/" in v):
                 continue
