@@ -1037,6 +1037,61 @@ def _iss(idx, po, col, msg):
     return {"idx": idx, "行": idx + 2, "PO号": po or "（PO号为空）", "列": col, "问题": msg}
 
 
+def _has_digit(v):
+    return any(ch.isdigit() for ch in safe_str(v))
+
+
+def _preflight_itf_only(idx, row, po, country):
+    """ITF 单独生成时的轻量校验：只看 ITF 标实际用到的字段。
+    必填：产品品名、产品英文名、ITF、内盒装量或外箱装量(UNIT SIZE)；
+    UK 版另需 TPNB/TPND，CE 版另需 CEORMSNO。
+    UK/CE 由 是否需要ITF-UK/CE 手动列决定，留空则按 PO 号前缀(380/520=UK, 999=CE)判断；
+    PO 号允许只填前缀（如 380 / 999）。其余数据不必填、不校验、不报错。"""
+    out = []
+    w_uk = wants(row, "是否需要ITF-UK", country in ("UK", "Ireland"))
+    w_ce = wants(row, "是否需要ITF-CE", country == "CE")
+    if not (w_uk or w_ce):
+        out.append(_iss(idx, po, "PO号",
+                        "无法判断 UK/CE：请填 PO 号前缀（380/520=UK，999=CE），或在 是否需要ITF-UK/CE 列填 Y"))
+        return out
+    # 必填（ITF 标实际用到的字段）
+    for c in ("产品品名", "产品英文名", "ITF"):
+        if not safe_str(row.get(c)):
+            out.append(_iss(idx, po, c, "ITF 必填"))
+    if not (_has_digit(row.get("内盒装量")) or _has_digit(row.get("外箱装量"))):
+        out.append(_iss(idx, po, "内盒装量/外箱装量", "至少填一个（ITF 上的 UNIT SIZE）"))
+    if w_uk:
+        for c in ("TPNB", "TPND"):
+            if not safe_str(row.get(c)):
+                out.append(_iss(idx, po, c, "ITF-UK 必填"))
+    if w_ce and not safe_str(row.get("CEORMSNO")):
+        out.append(_iss(idx, po, "CEORMSNO", "ITF-CE 必填"))
+    # 位数校验（仅 ITF 用到的字段，有值才校验）
+    checks = {"ITF": 14}
+    if w_uk:
+        checks["TPNB"] = 9
+        checks["TPND"] = 9
+    if w_ce:
+        checks["CEORMSNO"] = 13
+    itf_len_ok = True
+    for c, n in checks.items():
+        v = safe_str(row.get(c))
+        if c in ("TPNB", "TPND") and "/" in v:
+            continue
+        if v and not (v.isdigit() and len(v) == n):
+            out.append(_iss(idx, po, c, "必须是 %d 位数字（当前 %d 位）" % (n, len(v))))
+            if c == "ITF":
+                itf_len_ok = False
+    # ITF 条码正确性（位数 OK 才进一步校验，避免重复报错）
+    itf = safe_str(row.get("ITF"))
+    if itf and itf_len_ok:
+        try:
+            validate_itf(itf, safe_str(row.get("ITF加空格", itf)))
+        except ValueError as e:
+            out.append(_iss(idx, po, "ITF", str(e)))
+    return out
+
+
 def preflight(df, selected, cdu_map=None):
     """返回结构化问题列表：[{idx, 行, PO号, 列, 问题}]。"""
     issues = []
@@ -1046,6 +1101,11 @@ def preflight(df, selected, cdu_map=None):
         has_inner = not no_inner(row)
         po = safe_str(row.get("PO号"))
         prefix = po[:3]
+
+        # ITF 单独生成：只校验 ITF 所需字段，其余数据不必填、不校验、不报错
+        if set(selected) == {"ITF"}:
+            issues += _preflight_itf_only(idx, row, po, country)
+            continue
 
         # ① 完整性 + TPNB/TPND 的 "/" 规则（与所选类型无关，始终校验）
         if not po:
@@ -1240,8 +1300,16 @@ else:
 # ---- 第二步：自动体检 + 选类型 + 生成 ----
 if df is not None and len(df):
     # 录入后自动体检（每次编辑实时刷新）；按 PO 合并显示 + 问题格标红
-    issues = preflight(df, ALL_TYPES, cdu_map)
-    if issues:
+    st.markdown("**第二步：勾选本次要生成的类型**")
+    cols = st.columns(4)
+    selected = [t for i, t in enumerate(ALL_TYPES)
+                if cols[i].checkbox(TYPE_LABELS[t], value=True, key=f"chk_{t}")]
+
+    # 按所选类型体检（只勾选 ITF 时，只校验 ITF 所需字段，其余数据不必填/不报错）
+    issues = preflight(df, selected, cdu_map) if selected else []
+    if not selected:
+        st.info("请在上方勾选要生成的类型。")
+    elif issues:
         from collections import OrderedDict
         grouped = OrderedDict()
         for it in issues:
@@ -1253,11 +1321,6 @@ if df is not None and len(df):
         st.dataframe(pd.DataFrame(gp_rows), use_container_width=True, hide_index=True)
     else:
         st.success("✅ 数据体检通过，未发现问题。")
-
-    st.markdown("**第二步：勾选本次要生成的类型**")
-    cols = st.columns(4)
-    selected = [t for i, t in enumerate(ALL_TYPES)
-                if cols[i].checkbox(TYPE_LABELS[t], value=True, key=f"chk_{t}")]
 
     if st.button("🚀 开始生成", type="primary", use_container_width=True):
         st.session_state.download_data = None
