@@ -3,6 +3,8 @@
 从 Excel 数据源批量生成 Tesco 外箱标 / 内盒标 / ITF 条码标 / BD 条码标（导出为打包 PDF）。基于 Streamlit + LibreOffice。
 
 > 仅供 Suncha 内部使用。
+>
+> 
 
 ## 功能（v2）
 - **网页直接录入**：在网页表格里粘贴/编辑原始数据即可，**不再依赖 Excel 公式**；也可上传 Excel（原始数据即可）。
