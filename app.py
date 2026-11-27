@@ -990,9 +990,10 @@ def gen_bd(row, work_dir, out_dir, used, profile):
     if not _register(used, name):
         return [{"命名": name, "状态": "跳过", "说明": "同款产品已生成一次"}]
 
-    Code128 = barcode.get_barcode_class("code128")
+    # GS1-128 自动在起始符后添加 FNC1；号码和目视文本保持原样。
+    GS1_128 = barcode.get_barcode_class("gs1_128")
     img_tmp = os.path.join(work_dir, f"barcode_bd_{uuid.uuid4().hex}")
-    saved = Code128(bd_val, writer=ImageWriter()).save(img_tmp, options={"write_text": False, "module_height": 22.0})
+    saved = GS1_128(bd_val, writer=ImageWriter()).save(img_tmp, options={"write_text": False, "module_height": 22.0})
     crop_vertical_margin(saved)
     tpl = DocxTemplate(get_resource_path("模板_BD.docx"))
     ctx = {"BD条码号加空格": bd_spaced, "Barcode_Img": InlineImage(tpl, saved, width=Mm(140), height=Mm(70))}
@@ -1349,3 +1350,4 @@ if st.session_state.download_data is not None:
     st.download_button("📥 下载生成结果 (.zip)", data=st.session_state.download_data,
                        file_name=st.session_state.download_name, mime="application/zip",
                        type="primary", use_container_width=True)
+
