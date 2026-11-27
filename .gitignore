@@ -1,0 +1,11 @@
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+.streamlit/secrets.toml
+.env
+output/
+tmp/
+*.zip
+*.xlsx
+!1. Tesco数据源模板.xlsx

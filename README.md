@@ -1,78 +1,59 @@
 # Tesco 标贴与纸箱生成系统
 
-从 Excel 数据源批量生成 Tesco 外箱标 / 内盒标 / ITF 条码标 / BD 条码标（导出为打包 PDF）。基于 Streamlit + LibreOffice。
+供 Suncha 内部使用。从网页表格或 Excel 原始数据批量生成外箱、内盒、ITF-UK/CE 和 BD 标签，导出 PDF ZIP。
 
-> 仅供 Suncha 内部使用。
->
-> 
+## 使用
 
-## 功能（v2）
-- **网页直接录入**：在网页表格里粘贴/编辑原始数据即可，**不再依赖 Excel 公式**；也可上传 Excel（原始数据即可）。
-- **公式全后台化**：命名、CON、外箱尺寸、UK/CE、双人抬（按毛重）、BL（按英文名）、ITF加空格（3-5-6）、BD条码号、胶带颜色等全部由程序自动算。
-- **CDU 按 ITF 自动匹配**：维护一份 CDU 清单（ITF→外箱/内盒是否接触 CDU），系统按 ITF 自动给标签加印 CDU 文案；清单可在网页查看/编辑/导入/导出。
-- **每行开关留空即自动**：外箱默认做、有内盒才做内盒/BD、ITF 按订单国家；只有明确不做才填 N。
-- **一款产品只做一次**：ITF/BD/内盒 同款自动去重；外箱按每个 PO 一张。
-- 勾选要生成的类型 →「一键生成」→ 按类型分子文件夹打包 ZIP；生成前可体检，生成后给首张预览。
-- 数据格式：总外箱数/装量为整数（ITF 的 UNIT SIZE 只显示整数）；TPNB/TPND/ITF/EAN/CEORMSNO/SKU 文本护零；毛重/净重/尺寸可小数。
+1. 在网页录入数据，或下载空白 `.xlsx` 模板填写后上传。无需 Excel 公式，不支持旧版 `.xls`。
+2. 选择需要的标签类型。行级开关 `Y` 表示生成、`N` 表示不生成、空白按业务规则自动判断。
+3. 修复体检提示，并核对预计数量和任务清单。存在错误时不能生成，后台执行入口也会再次校验。
+4. 生成后按类型/文件名选择预览，再下载 ZIP。包内附生成明细 CSV 和批次信息 JSON；部分失败会明确提示，只打包成功 PDF。
+5. 修改数据、类型或 CDU 清单后，旧下载结果失效，必须重新生成。
+
+## 数据规则
+
+- ITF、EAN、TPNB、TPND、CEORMSNO、SKU 按文本填写，保留前导 0。已经在 Excel 中丢掉的 0 无法自动恢复。
+- 数量必须为正整数，不会四舍五入。毛重、净重、尺寸必须大于 0，净重不能超过毛重。
+- 无内盒请留空内盒装量；内外装量相等也视为无内盒，自动跳过内盒/BD。填写内盒装量时需为正整数；涉及内盒/BD/外箱的装量比例必须整除。
+- 校验按实际生成类型执行。仅生成 ITF 时不要求毛重、外箱尺寸等无关字段。UK/CE 可按 PO 前缀自动判断，也可用行级开关指定。
+- 国家、尺寸、双人抬、条码、CDU 文案、文件名等派生字段统一由后台重算，上传旧表中的对应公式结果会被忽略。不支持隐式手工覆盖派生字段。
+- 去重依据标签类型、产品标识和实际印刷字段。不同内容即使同名也会生成独立文件；同内容仅在首次成功后合并，失败后遇到相同记录仍可重试。
+- CDU 清单可导入/导出 CSV；相同 ITF 的冲突设置会阻止生成。清单保存在当前会话，不是多人共享数据库，重新打开会话后需重新导入或配置仓库内置 `cdu_list.csv`。
+- ZIP 中每份标签必须为单页且包含可读文字。长品名在最小字号下仍换行时会报告失败，不能把生成成功等同于实物印刷验收。
 
 ## 本地运行
+
+建议 Python 3.12。Python 直接依赖固定在 `requirements.txt`，系统 LibreOffice 版本由部署环境提供。
+
 ```bash
-# 1) 系统依赖（Debian/Ubuntu）
-sudo apt update && sudo apt install -y libreoffice fonts-noto-cjk fontconfig
-
-# 2) Python 依赖
 pip install -r requirements.txt
-
-# 3) 启动
 streamlit run app.py
 ```
 
-## 部署到网页（Streamlit Community Cloud）
+系统还需 LibreOffice；Linux 安装 `libreoffice fonts-noto-cjk fontconfig`，macOS 可安装 LibreOffice 应用。项目启动不会立即安装字体；首次生成时会将随附字体复制到用户字体目录，Linux 刷新 fontconfig。PDF 文本检查和预览通过 PyMuPDF 完成。
 
-本项目已按 Streamlit Community Cloud 规范配置，`packages.txt` 会在云端自动安装 LibreOffice 与中日韩字体。
+Streamlit Community Cloud 的系统依赖由 `packages.txt` 安装。配置应用访问权限以限定内部用户；可选口令门在 `.streamlit/secrets.toml` 或云端 Secrets 设置：
 
-1. 把本文件夹作为一个 GitHub 仓库推送（见下方“推送到 GitHub”）。
-2. 打开 https://share.streamlit.io ，用 GitHub 账号登录。
-3. **New app** → 选择你的仓库、分支 `main`、主文件 `app.py` → **Deploy**。
-4. 首次部署会安装 LibreOffice，冷启动较慢（数分钟），属正常现象。
-
-### 限制访问（内部使用）
-两层，任选或叠加：
-
-- **应用私有化（推荐）**：在应用的 **Settings → Sharing** 中关闭公开，改为 “Only specific people”，按邮箱邀请内部同事。只有被邀请的 Google/GitHub 邮箱能打开。
-- **口令门（补充）**：在 **Settings → Secrets** 里填入
-  ```toml
-  app_password = "你的内部口令"
-  ```
-  保存后，应用会先要求输入口令。未设置该密钥时不拦截（方便本地调试）。
-
-## 推送到 GitHub
-在本文件夹内执行：
-```bash
-git init
-git add .
-git commit -m "Tesco 标贴系统（修复版）"
-git branch -M main
-git remote add origin https://github.com/<你的用户名>/<仓库名>.git
-git push -u origin main
+```toml
+app_password = "替换为内部口令"
 ```
-> `.gitignore` 已排除数据源 `*.xlsx`、生成的 `*.zip` 和机密 `secrets.toml`，不会误传敏感数据。
 
-## Excel 数据源（合并版·三色结构）
-在网站左侧点「下载空白数据源模板」，或用仓库里的 `Tesco数据源模板.xlsx`。表头分三色，忠实沿用原「外箱内盒数据源」的公式设计并合并了标贴源：
+未配置口令时沿用开放访问行为，适合本地使用；部署访问权限由管理员配置。
 
-- 🟩 **绿色 = 手填数据**（顺序固定 A–S）：产品品名、产品英文名、PO号、总外箱数、TPNB、TPND、ITF、category、EAN、外箱装量、内盒装量、CEORMSNO、SKU、VSN、毛重、净重、外箱长/宽/高。代码类列已设文本格式，**保护前导 0**。
-- 🟧 **橙色 = 公式列**（Excel 自动算，勿手改）：订单国家、CON不加粗/加粗/CON、外箱BD号、外箱尺寸、双人抬标识、BL、ITF加空格、BD条码号、BD条码号加空格、胶带颜色、有CDU加印文字(内盒版)、五个文件命名列。
-- 🟨 **黄色 = 人工选择**（下拉）：节日logo、是否有CDU、内盒是否直接接触CDU、是否要做外箱/内盒、是否需要ITF-UK/ITF-CE、是否要做BD（填 `Y`/`N`）。
+## 维护与验证
 
-**重要：必须用 Excel 打开填写并保存**，让公式计算出结果后再上传——网站读取的是公式算出的值（若某公式列为空，程序会回退用内置规则兜底命名/尺寸）。
+- `app.py`：页面、访问口令、输入及批次状态。
+- `rules.py`：无页面副作用的数据规则、体检、任务计划、输入指纹。
+- `engine.py`：Word 模板渲染、PDF 验证、批量执行和打包。
+- `tests/test_regressions.py`：错标/漏标边界、失败重试、数据变化、页面冒烟测试。
+- `tests/render_smoke.py`：真实模板经 LibreOffice 生成 UK、CE、Ireland、长品名及同名不同码样例，检查单页、模板占位符、预期数量，并从最终 PDF 解码核对 ITF 和 GS1-128 BD。
 
-公式要点（已修好原表中的 `#REF!`）：
-- 命名：外箱 `{PO}{品名}{总箱数}个外箱`；内盒 `内盒-{品名}`；ITF-UK/CE `ITF-UK/CE-{品名}-{英文名}`；BD `BD-{品名}`。
-- 双人抬：380 单件毛重>23 或 999 毛重>14 自动标「双人抬」。
-- BL：英文名含 Go Cook/Tesco→Tesco，含 F&F Home→FF。
-- BD条码号：`02`+ITF+`37`+（外箱装量/内盒装量），装量相等时不产生 BD。
-- ITF 位数须偶数（ITF-14 为 14 位）；奇数位报错而**不会**被静默补 0。条码目视号去空格后须与条码值一致。
+```bash
+pip install -r requirements-test.txt
+python -m unittest discover -s tests -v
+python tests/render_smoke.py
+```
 
-## 本次修复与改造要点
-详见 `修复说明.md`。
+CI 配置模板位于 `ci/github-actions.yml`；将它复制到 `.github/workflows/tests.yml` 后启用。工作流会运行两类测试并保留 PDF/PNG 检查产物。`output/`、生成 ZIP、上传 Excel 和本地 Secrets 不纳入版本控制；仓库原有模板文件仍被保留。
+
+原有 `修复说明.md` 为历史版本记录，以本说明和当前代码为准。尚未包含实物打印后的扫码与尺寸验收。
